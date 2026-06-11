@@ -161,6 +161,7 @@ jobs:
             CXX="$TC/bin/${PREFIX}-g++ -B$TC/bin/" \
             STRIP="$TC/bin/${PREFIX}-strip" \
             CFLAGS="-march=armv5 -mfloat-abi=soft -mthumb -Os -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSRT_STATIC" \
+            LIBSRT_BUILD_ARM=$GITHUB_WORKSPACE/third_party/libsrt/build-$PREFIX \
             BIN_DIR=$GITHUB_WORKSPACE/build/binaries-$PREFIX 2>&1 | tail -30
           BIN=$GITHUB_WORKSPACE/build/binaries-$PREFIX/ap2p
           test -f "$BIN"
