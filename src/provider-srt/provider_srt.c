@@ -662,7 +662,7 @@ static pump_request_t    g_pending_pump;          /* protected by g_pump_mtx */
 static int               g_pending_valid = 0;     /* protected by g_pump_mtx */
 static atomic_int        g_pump_cancel  = 0;      /* read by pump thread without lock */
 static atomic_int        g_pump_running = 0;      /* set by pump thread, read by sig */
-static SRTSOCKET         g_active_srt   = SRT_INVALID_SOCK;  /* protected by g_pump_mtx */
+static SRTSOCKET         g_active_srt   = -1;  /* SRT_INVALID_SOCK — GCC5/C99: static const isn't a constant expr */
 
 /* Pump thread reads from local HTTP-FLV TCP and sends to SRT until any
  * of: (a) SRT breaks, (b) local closed, (c) cancel set, (d) shutdown. */
