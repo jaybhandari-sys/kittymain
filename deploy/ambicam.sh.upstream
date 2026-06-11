@@ -1,0 +1,345 @@
+#!/bin/sh
+
+# ============================================================
+# ambicam.sh — Improved startup script
+# Fixes: race conditions, missing config, library errors,
+#         no process monitoring
+# ============================================================
+
+LOGFILE="/tmp/ambicam.log"
+export TZ='GMT-5:30'
+
+AMBICAM_DIR="/mny/mtd/ipc/ambicam"
+CONFIG_FILE="/etc/jffs2/ambicam/P2Pambicam_min.ini"
+MQTT_BIN="${AMBICAM_DIR}/MQTT_vcamclient_Augentix"
+P2P_BIN="${AMBICAM_DIR}/P2Pambicam"
+
+# Max wait time for config file (in seconds)
+CONFIG_WAIT_TIMEOUT=120
+# How often to check for config file (in seconds)
+CONFIG_CHECK_INTERVAL=3
+# Max retries for P2Pambicam if it fails
+P2P_MAX_RETRIES=5
+
+# ----------------------------------------------------------
+# Logging
+# ----------------------------------------------------------
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"
+    # Also print to console for debug
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+# ----------------------------------------------------------
+# Step 1: Wait for filesystem to be fully ready
+# ----------------------------------------------------------
+wait_for_filesystem() {
+    log_message "Waiting for filesystem to be ready..."
+    local retries=0
+    while [ ! -d "$AMBICAM_DIR" ]; do
+        retries=$((retries + 1))
+        if [ $retries -ge 30 ]; then
+            log_message "ERROR: ${AMBICAM_DIR} not available after 30 attempts. Aborting."
+            exit 1
+        fi
+        log_message "Waiting for ${AMBICAM_DIR} to be mounted... (attempt ${retries})"
+        sleep 2
+    done
+    log_message "Filesystem is ready."
+}
+
+# ----------------------------------------------------------
+# Step 2: Create symlinks with validation
+# ----------------------------------------------------------
+create_symlinks() {
+    log_message "Creating library symlinks..."
+
+    # Define source -> target pairs
+    set -- \
+        "${AMBICAM_DIR}/libpaho-mqtt3cs.so.1.3.14:${AMBICAM_DIR}/libpaho-mqtt3cs.so.1" \
+        "/usr/lib/libcrypto.so.3:${AMBICAM_DIR}/libcrypto.so.1.1" \
+        "/usr/lib/libssl.so.3:${AMBICAM_DIR}/libssl.so.1.1" \
+        "${AMBICAM_DIR}/libcurl.so.4.8.0:${AMBICAM_DIR}/libcurl.so.4"
+
+    local all_ok=1
+    for pair in "$@"; do
+        src="${pair%%:*}"
+        dst="${pair##*:}"
+
+        if [ ! -f "$src" ]; then
+            log_message "WARNING: Source library not found: ${src}"
+            all_ok=0
+            continue
+        fi
+
+        ln -sfn "$src" "$dst"
+
+        if [ -L "$dst" ] && [ -f "$dst" ]; then
+            log_message "OK: ${dst} -> ${src}"
+        else
+            log_message "ERROR: Failed to create symlink ${dst} -> ${src}"
+            all_ok=0
+        fi
+    done
+
+    if [ $all_ok -eq 0 ]; then
+        log_message "WARNING: Some symlinks failed. Continuing but may have library errors."
+    fi
+}
+
+# ----------------------------------------------------------
+# Step 3: Set and verify LD_LIBRARY_PATH
+# ----------------------------------------------------------
+set_ld_library_path() {
+    export LD_LIBRARY_PATH="${AMBICAM_DIR}"
+    log_message "LD_LIBRARY_PATH set to: ${LD_LIBRARY_PATH}"
+
+    # Verify key libraries are actually loadable
+    local missing=0
+    for lib in libpaho-mqtt3cs.so.1 libcrypto.so.1.1 libssl.so.1.1 libcurl.so.4; do
+        if [ ! -f "${AMBICAM_DIR}/${lib}" ]; then
+            log_message "ERROR: Library not found: ${AMBICAM_DIR}/${lib}"
+            missing=1
+        fi
+    done
+
+    if [ $missing -eq 1 ]; then
+        log_message "ERROR: Required libraries missing. Cannot proceed."
+        exit 1
+    fi
+    log_message "All required libraries verified."
+}
+
+# ----------------------------------------------------------
+# Step 4: Check internet connectivity (to actual server, not just Google)
+# ----------------------------------------------------------
+check_internet() {
+    log_message "Checking internet connection..."
+    local retries=0
+    while true; do
+        # First check basic internet via ping
+        if ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
+            log_message "Basic internet is available."
+
+            # Verify FRPS server is reachable via ping
+            # (port 7000 is FRPS protocol port, not a plain TCP socket)
+            if ping -c 1 -W 3 p2p.arcisai.io > /dev/null 2>&1; then
+                log_message "FRPS server (p2p.arcisai.io) is reachable."
+                return 0
+            else
+                log_message "WARNING: Internet OK but FRPS server (p2p.arcisai.io) not reachable. Will retry..."
+            fi
+        fi
+
+        retries=$((retries + 1))
+        if [ $retries -ge 60 ]; then
+            log_message "WARNING: Connectivity issues after 5 minutes. Attempting to continue anyway..."
+            return 1
+        fi
+        log_message "Connectivity check failed. Retrying... (attempt ${retries})"
+        sleep 5
+    done
+}
+
+# ----------------------------------------------------------
+# Step 5: Start MQTT and wait for config file
+# ----------------------------------------------------------
+start_mqtt_and_wait_for_config() {
+    # Kill any stale MQTT process
+    if pidof MQTT_vcamclient_Augentix > /dev/null 2>&1; then
+        log_message "Killing stale MQTT process..."
+        killall MQTT_vcamclient_Augentix 2>/dev/null
+        sleep 2
+    fi
+
+    log_message "Starting MQTT binary..."
+    ${MQTT_BIN} &
+    MQTT_PID=$!
+    sleep 2
+
+    # Check MQTT actually started
+    if ! kill -0 $MQTT_PID 2>/dev/null; then
+        log_message "ERROR: MQTT binary failed to start!"
+        return 1
+    fi
+    log_message "MQTT started with PID: ${MQTT_PID}"
+
+    # Now wait for config file to be delivered
+    log_message "Waiting for config file: ${CONFIG_FILE} (timeout: ${CONFIG_WAIT_TIMEOUT}s)..."
+    local waited=0
+    while [ $waited -lt $CONFIG_WAIT_TIMEOUT ]; do
+        # Check if file exists AND has content (not empty)
+        if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+            log_message "Config file received and has content ($(wc -c < "$CONFIG_FILE") bytes)"
+
+            # Validate ALL required sections and keys are present
+            # Config must have: [common] with server_addr/server_port/token,
+            # HTTP proxy section, and RTSP/TCP section with remote_port
+            local valid=1
+            local missing=""
+
+            if ! grep -q "\[common\]" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} [common]"
+                valid=0
+            fi
+            if ! grep -q "server_addr" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} server_addr"
+                valid=0
+            fi
+            if ! grep -q "server_port" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} server_port"
+                valid=0
+            fi
+            if ! grep -q "token" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} token"
+                valid=0
+            fi
+            if ! grep -q "type = tcp" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} [RTSP-tcp-section]"
+                valid=0
+            fi
+            if ! grep -q "remote_port" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} remote_port"
+                valid=0
+            fi
+            if ! grep -q "type = http" "$CONFIG_FILE" 2>/dev/null; then
+                missing="${missing} [HTTP-section]"
+                valid=0
+            fi
+
+            if [ $valid -eq 1 ]; then
+                log_message "Config file fully validated: [common], HTTP proxy, and RTSP/TCP sections all present."
+                # Log the config for debugging
+                log_message "--- Config content ---"
+                cat "$CONFIG_FILE" >> "$LOGFILE"
+                log_message "--- End config ---"
+                return 0
+            else
+                log_message "WARNING: Config incomplete, missing:${missing}. Waiting for full delivery..."
+            fi
+        fi
+
+        # Also check MQTT is still alive
+        if ! kill -0 $MQTT_PID 2>/dev/null; then
+            log_message "ERROR: MQTT process died while waiting for config!"
+            return 1
+        fi
+
+        sleep $CONFIG_CHECK_INTERVAL
+        waited=$((waited + CONFIG_CHECK_INTERVAL))
+        if [ $((waited % 15)) -eq 0 ]; then
+            log_message "Still waiting for config file... (${waited}s elapsed)"
+        fi
+    done
+
+    log_message "ERROR: Config file not received within ${CONFIG_WAIT_TIMEOUT} seconds!"
+    return 1
+}
+
+# ----------------------------------------------------------
+# Step 6: Start P2Pambicam with retry logic
+# ----------------------------------------------------------
+start_p2p() {
+    local retry=0
+    while [ $retry -lt $P2P_MAX_RETRIES ]; do
+        # Kill any stale P2P process
+        if pidof P2Pambicam > /dev/null 2>&1; then
+            log_message "Killing stale P2Pambicam process..."
+            killall P2Pambicam 2>/dev/null
+            sleep 2
+        fi
+
+        # Re-verify config file before each attempt
+        if [ ! -s "$CONFIG_FILE" ]; then
+            log_message "ERROR: Config file missing or empty before P2P start (attempt $((retry + 1)))"
+            retry=$((retry + 1))
+            sleep 5
+            continue
+        fi
+
+        log_message "Starting P2Pambicam (attempt $((retry + 1)))..."
+        ${P2P_BIN} -c "$CONFIG_FILE" -f -d 7 &
+        P2P_PID=$!
+        sleep 5
+
+        # Check it's still running
+        if kill -0 $P2P_PID 2>/dev/null; then
+            log_message "P2Pambicam started with PID: ${P2P_PID}"
+            return 0
+        else
+            log_message "WARNING: P2Pambicam exited immediately (attempt $((retry + 1)))"
+            retry=$((retry + 1))
+            sleep 5
+        fi
+    done
+
+    log_message "ERROR: P2Pambicam failed after ${P2P_MAX_RETRIES} attempts!"
+    return 1
+}
+
+# ----------------------------------------------------------
+# Step 7: Monitor both processes and restart if needed
+# ----------------------------------------------------------
+monitor_processes() {
+    log_message "Starting process monitor..."
+    while true; do
+        sleep 30
+
+        # Check MQTT
+        if ! pidof MQTT_vcamclient_Augentix > /dev/null 2>&1; then
+            log_message "WARNING: MQTT process died! Restarting entire stack..."
+            start_mqtt_and_wait_for_config
+            if [ $? -eq 0 ]; then
+                start_p2p
+            fi
+        fi
+
+        # Check P2Pambicam
+        if ! pidof P2Pambicam > /dev/null 2>&1; then
+            log_message "WARNING: P2Pambicam process died! Restarting..."
+            start_p2p
+        fi
+    done
+}
+
+# ===========================================================
+# MAIN EXECUTION
+# ===========================================================
+log_message "========================================"
+log_message "ambicam.sh starting..."
+log_message "========================================"
+
+# Initial delay for system to settle after boot
+sleep 3
+
+# Step 1: Filesystem
+wait_for_filesystem
+
+# Step 2: Symlinks
+create_symlinks
+
+# Step 3: Library path
+set_ld_library_path
+
+# Step 4: Internet
+check_internet
+
+# Step 5: MQTT + config
+if ! start_mqtt_and_wait_for_config; then
+    log_message "MQTT/config failed. Retrying full MQTT start once more..."
+    sleep 10
+    if ! start_mqtt_and_wait_for_config; then
+        log_message "FATAL: Cannot get config from server. Exiting."
+        exit 1
+    fi
+fi
+
+# Step 6: P2Pambicam
+if ! start_p2p; then
+    log_message "FATAL: P2Pambicam failed to start. Exiting."
+    exit 1
+fi
+
+# Step 7: Monitor (runs forever)
+log_message "All services started. Entering monitor mode."
+monitor_processes

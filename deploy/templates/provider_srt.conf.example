@@ -1,0 +1,73 @@
+# provider_srt.conf — Augentix camera SRT provider (Phase 2, multi-thread).
+#
+# Runs on-camera at /mny/mtd/ipc/ambicam/provider_srt.  Drains the local
+# HTTP-FLV stream from app.out (port 80), registers with the cloud signaling
+# server, and pumps the FLV stream over an SRT rendezvous tunnel to the
+# consumer when one connects.
+#
+# IMPORTANT (v1.13+):  the running version of this file on a deployed
+# camera is delivered by the BROKER via MQTT topic torque/rx/<serial>/81
+# (case 81 in src/mqtt-vcamclient/HTTP.c, which writes the payload to
+# /mny/mtd/ipc/ambicam/provider_srt.conf).  The broker fills in the real
+# TURN/STUN/SIGNALING/API_TOKEN values per device, so cameras NEVER carry
+# those secrets in their firmware image.  This .example file is kept as
+# REFERENCE ONLY — every secret-bearing field uses a REPLACE_WITH_* marker
+# so an operator can't accidentally deploy this verbatim.  See
+# ops/mqtt-provisioning.md.
+
+# ---- Local HTTP-FLV source ------------------------------------------------
+LOCAL_HOST=127.0.0.1
+LOCAL_PORT=80
+LOCAL_HTTP_PATH=/flv/live_ch0_1.flv?verify=REPLACE_WITH_VERIFY_TOKEN
+LOCAL_HTTP_AUTH=Basic YWRtaW46
+
+# ---- Service identity (set by ambicam.sh from BurnUID at first boot) -----
+SERVICE_ID=REPLACE_WITH_DEVICE_SERVICE_ID
+
+# ---- Cloud signaling (one of two schemes) --------------------------------
+#
+# DEFAULT in this template: plain-TCP path against the GCP staging
+# signaling VM (kitty-signaling-server-del / signaling.devices.arcisai.io).
+# nginx-stream-fronted on :80 → signaling_server on 127.0.0.1:8888.
+# Matches the v1.13.1 first-rollout posture (KITTY_NO_TLS build).
+SIGNALING_HOST=signaling.devices.arcisai.io
+SIGNALING_PORT=80
+SIGNALING_SCHEME=plain
+#
+# *** TLS + mTLS path (v1.13+ TLS-on build, NOT first rollout) ***
+# Cameras connect to the same kitty-signaling-server VM via nginx on :443.
+# nginx terminates TLS and verifies the device's client certificate against
+# the ArcisAI IoT Intermediate CA HSM.  All four TLS keys are required —
+# missing any is a hard config error (we never silently downgrade to plain).
+# Enabling this requires both:
+#   (a) provider_srt built with KITTY_TLS_FLAG=-DKITTY_TLS, AND
+#   (b) a per-device cert+key provisioned under /etc/jffs2/arcisai/.
+#
+#SIGNALING_HOST=signaling.devices.arcisai.io
+#SIGNALING_PORT=443
+#SIGNALING_SCHEME=tls
+#SIGNALING_CA=/etc/jffs2/arcisai/ca-chain.pem
+#SIGNALING_CERT=/etc/jffs2/arcisai/device.crt
+#SIGNALING_KEY=/etc/jffs2/arcisai/device.key
+#SIGNALING_VERIFY_HOST=1
+
+# Signaling server API token — protects the SRT_REGISTER and SRT_REQUEST
+# endpoints from rogue cameras.  Broker pushes the real value per device.
+API_TOKEN=REPLACE_WITH_API_TOKEN
+
+# ---- STUN for SRFLX gathering (UDP) ---------------------------------------
+STUN_HOST=REPLACE_WITH_STUN_HOST
+STUN_PORT=5349
+
+# ---- TURN (Phase 3 fallback; not currently used by the SRT data path) -----
+TURN_HOST=REPLACE_WITH_TURN_HOST
+TURN_PORT=5349
+TURN_USERNAME=REPLACE_WITH_TURN_USERNAME
+TURN_PASSWORD=REPLACE_WITH_TURN_PASSWORD
+
+# ---- SRT tuning -----------------------------------------------------------
+# LATENCY_MS is parsed but not yet wired to srt_setsockopt (see Finding 1
+# in ops/realtime-latency.md).  Will be wired through in a follow-up release.
+LATENCY_MS=300
+
+VERBOSE=1

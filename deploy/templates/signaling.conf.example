@@ -1,0 +1,29 @@
+# P2P Signaling Server Configuration
+
+# Signaling TCP port (providers/consumers connect here)
+SIGNALING_PORT=8888
+
+# Maximum simultaneously registered providers (cameras). 0 = unlimited.
+# For large deployments set to 0 or a number matching your camera count.
+MAX_PROVIDERS=0
+
+# HTTP dashboard port
+HTTP_PORT=8889
+
+# Dashboard authentication credentials
+# SECURITY: Change before deploying; do not commit real passwords.
+AUTH_USERNAME=REPLACE_WITH_DASHBOARD_USERNAME
+AUTH_PASSWORD=REPLACE_WITH_DASHBOARD_PASSWORD
+
+# API Token for programmatic access (internal use)
+# Use via: Authorization: Bearer <token> or X-API-Token: <token>
+# SECURITY: Generate a strong random token — e.g. `openssl rand -hex 32` —
+#          and NEVER commit the real value to source control.
+API_TOKEN=REPLACE_WITH_API_TOKEN
+
+# TURN server (Coturn on your VPS)
+# SECURITY: Set real host/credentials at deploy time, do not commit them.
+TURN_SERVER_HOST=REPLACE_WITH_TURN_HOST
+TURN_SERVER_PORT=3478
+TURN_USERNAME=REPLACE_WITH_TURN_USERNAME
+TURN_PASSWORD=REPLACE_WITH_TURN_PASSWORD

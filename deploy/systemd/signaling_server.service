@@ -1,0 +1,17 @@
+[Unit]
+Description=P2P Signaling Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Signalling_Server/Signaling-Server/P2P_Libjuice-main/binaries
+ExecStart=/root/Signalling_Server/Signaling-Server/P2P_Libjuice-main/binaries/signaling_server /root/Signalling_Server/Signaling-Server/P2P_Libjuice-main/binaries/signaling.conf
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=signaling-server
+
+[Install]
+WantedBy=multi-user.target

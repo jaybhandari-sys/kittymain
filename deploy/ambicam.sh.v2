@@ -1,0 +1,133 @@
+#!/bin/sh
+# ambicam.sh — process supervisor for the ap2p daemon.
+set -u
+# Boot-timing anchor: capture launcher-start kernel uptime so ap2p can
+# compute "ms since launcher started" for each milestone it records.
+# (Single line, atomically written; ap2p reads + tolerates missing file.)
+awk '{print $1}' /proc/uptime > /tmp/boot_t0 2>/dev/null
+DIR="/mny/mtd/ipc/ambicam"
+LOG="$DIR/ap2p.log"
+MAX_LOG=262144   # 256 KB → ~50 min of typical keepalive output before rotation
+
+# Poll for /mny/mtd/ipc/ambicam/ — used to be sleep 2 with 60 s cap; bump
+# to 0.2 s with 15 s cap so we don't waste boot time on a partition that
+# is usually already mounted.
+n=0
+while [ ! -d "$DIR" ]; do
+    n=$((n + 1)); [ "$n" -ge 75 ] && exit 1
+    sleep 0.2
+done
+
+# Network-ready gate: don't exec ap2p until we have a default route.  Without
+# this, ap2p's first MQTT connect attempts fire BEFORE wlan0 has a usable
+# IP / route, each fails after a TCP-connect timeout, and our 5 s retry
+# back-off racks up 15–20 s of dead time.  Costs ~0 ms once the network
+# is up; saves the wasted retry storm when it isn't.
+n=0
+while ! grep -qE '^[^[:space:]]+[[:space:]]+00000000[[:space:]]+[0-9A-F]+[[:space:]]+0003' \
+        /proc/net/route 2>/dev/null; do
+    n=$((n + 1)); [ "$n" -ge 150 ] && break   # 30 s cap — proceed anyway after that
+    sleep 0.2
+done
+echo "ambicam: default route ready after ${n} polls ($((n / 5)).${n}s)" >> "$LOG" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# v2.0.7-rc5 (revised) — NTP failsafe (kernel clock sync at boot).
+#
+# Vendor's case-23 PUT /netsdk/system/time/ntp silently returns 200 but
+# does NOT persist ntpServerDomain on firmware 6.0.13.578021.  OSD
+# timestamps drift seconds per hour without an external sync.  We bypass
+# the broken vendor API and set the kernel clock directly.
+#
+# Probed busybox 1.37.0 on Augentix HC1705K — applets present:
+#   YES:  date, hwclock, nc, dd, od, nslookup, wget, awk, printf
+#   NO:   ntpd, ntpdate, sntp
+# So no classical NTP tool; we roll a raw NTP-over-UDP query via `nc -u`.
+#
+# Fallback chain (each step short-timeout-bounded; total budget under 10 s):
+#   1. raw NTP: 48-byte client request to NTP_SRV:123 via `nc -u`,
+#      parse 32-bit unsigned-int seconds field at offset 40, subtract
+#      2208988800 (NTP→Unix epoch) -> `date -u -s @<unix>`.
+#   2. HTTP Date: header via `busybox wget -S` (no --timeout arg;
+#      busybox wget rejects it).  Used as fallback when raw NTP fails
+#      (DNS broken, UDP/123 blocked, etc.).  Accuracy +/- 1 s, fine for OSD.
+#   3. Bail; kernel keeps the SoC RTC's last value.
+#
+# Configurable via env (defaults shipped for production):
+#   NTP_SRV=pool.ntp.org
+#   HTTP_TIME_URL=http://www.google.com
+NTP_SRV="${NTP_SRV:-pool.ntp.org}"
+HTTP_TIME_URL="${HTTP_TIME_URL:-http://www.google.com}"
+
+ntp_via_nc() {
+    addr=$(nslookup "$NTP_SRV" 2>/dev/null \
+           | awk '/^Address[[:space:]]*[0-9]*:/ {split($0,a,": "); print a[2]; exit}' \
+           | head -1)
+    [ -z "$addr" ] && return 1
+
+    # 48-byte NTPv3 client request: 0x1b 0x00 ... 0x00 (LI=0, VN=3, Mode=3).
+    req='\033'
+    pad=0
+    while [ "$pad" -lt 47 ]; do
+        req="${req}\\000"
+        pad=$((pad + 1))
+    done
+
+    tmp="/tmp/ntp.bin"
+    rm -f "$tmp"
+    printf "$req" | nc -u -w 3 "$addr" 123 > "$tmp" 2>/dev/null
+    [ "$(wc -c < "$tmp" 2>/dev/null)" -lt 48 ] && return 1
+
+    # Bytes 40-43 are the transmit-timestamp seconds (big-endian).
+    ntp_secs=$(od -An -t u4 -N 4 -j 40 "$tmp" 2>/dev/null | tr -d ' ')
+    [ -z "$ntp_secs" ] && return 1
+    [ "$ntp_secs" -lt 2208988800 ] && return 1
+    unix_secs=$((ntp_secs - 2208988800))
+    date -u -s "@$unix_secs" >/dev/null 2>&1 || return 1
+    echo "ambicam: raw-NTP sync OK ($NTP_SRV -> $addr, unix=$unix_secs)" >> "$LOG"
+    return 0
+}
+
+ntp_via_http_date() {
+    hdate=$(busybox wget -S -O /dev/null "$HTTP_TIME_URL" 2>&1 \
+            | awk -F': ' 'tolower($1) ~ /^[[:space:]]*date/ {sub(/^ */, "", $2); print $2; exit}')
+    [ -z "$hdate" ] && return 1
+    date -u -s "$hdate" >/dev/null 2>&1 || return 1
+    echo "ambicam: HTTP-Date sync OK ('$hdate')" >> "$LOG"
+    return 0
+}
+
+if ntp_via_nc; then
+    :
+elif ntp_via_http_date; then
+    :
+else
+    echo "ambicam: NTP failsafe -- both methods failed; OSD may drift" >> "$LOG" 2>/dev/null
+fi
+
+# Persist kernel time to RTC so the new clock survives a reboot.
+hwclock -w 2>/dev/null && \
+    echo "ambicam: RTC updated from kernel time" >> "$LOG" 2>/dev/null
+echo "ambicam: kernel time after NTP failsafe = $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$LOG" 2>/dev/null
+
+# Background log-size watchdog.  Every 60 s, if ap2p.log is over MAX_LOG
+# bytes, copy-truncate it (keep ap2p.log.old as one prior rotation;
+# ap2p's open fd stays valid — Linux truncate semantics).
+(
+    while true; do
+        sleep 60
+        [ -f "$LOG" ] || continue
+        sz=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+        [ "$sz" -gt "$MAX_LOG" ] || continue
+        cp "$LOG" "$LOG.old" 2>/dev/null
+        : > "$LOG"
+    done
+) &
+ROTATOR=$!
+trap 'killall -TERM ap2p 2>/dev/null; kill $ROTATOR 2>/dev/null; exit 0' TERM INT
+backoff=2
+while true; do
+    "$DIR/ap2p" >> "$LOG" 2>&1
+    sleep "$backoff"
+    backoff=$((backoff * 2)); [ "$backoff" -gt 60 ] && backoff=60
+done

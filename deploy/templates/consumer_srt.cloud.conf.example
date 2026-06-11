@@ -1,0 +1,33 @@
+# consumer_srt production config for 142.93.223.221 (Phase 1)
+#
+# This process accepts ONE inbound SRT connection per stream_id (cam001 here)
+# and serves the resulting byte stream as HTTP-FLV at HTTP_PATH on HTTP_PORT.
+# Phones / browsers / VLC pull from the HTTP-FLV endpoint.
+
+# UDP port the cloud listens on for inbound SRT from cameras.  Must be opened
+# in ufw and on any cloud-provider firewall.
+SRT_PORT=9888
+
+# TCP port that phones / browsers pull HTTP-FLV from.
+# 8080 is reserved by the existing libjuice "http-server provider download"
+# rule on this host, so we use 8081.
+HTTP_PORT=8081
+
+# Required STREAMID match.  The provider_srt running on the camera must send
+# the same value during SRT handshake or the connection will be rejected.
+STREAM_ID=cam001
+
+# HTTP path to serve the live FLV at.  Match what the Android app builds.
+HTTP_PATH=/flv/live_ch0_1.flv
+
+# Optional ?verify=<token> check.  Leave blank during Phase 1 testing so
+# curl can pull without credentials; tighten later by setting this to the
+# AES-CBC base64 token (project_arcis_crypto memory).
+VERIFY_TOKEN=
+
+# SRT receiver latency budget in ms.  Higher = smoother under loss but more
+# lag.  300 ms is a good live-CCTV default.
+LATENCY_MS=300
+
+# 1 to log every burst.  Useful during bring-up; turn down once stable.
+VERBOSE=0

@@ -1,0 +1,92 @@
+# branding/manifest.toml
+#
+# v2.0 brand contract for the single-binary ap2p.  This file is the
+# source of truth for branding/verify.sh and for any future agent that
+# needs to know which library names, NEEDED entries, and config keys
+# are part of the brand-neutral surface.
+#
+# v2.0 is KITTY_NO_TLS: libap2p_tls / libap2p_crypto symlinks are
+# RESERVED here for v2.1 but not yet shipped or linked against.
+
+[brand]
+prefix      = "ap2p"
+binary_name = "ap2p"
+# Final on-camera path. 1.5 MB flash partition; today's usage 1.68 MB,
+# v2.0 target 1.34 MB after strip + --gc-sections + section scrubbing.
+install_path = "/mny/mtd/ipc/ambicam/ap2p"
+
+[forbidden_tokens]
+# Regex patterns (case-insensitive) that must NOT appear in the final
+# binary's strings.  branding/verify.sh runs `strings | grep -iE` over
+# the union of these.  Hits indicate either an un-stripped upstream
+# banner (OpenSSL/libcurl/Paho/Mosquitto/libsrt/libjuice/Augentix) or
+# a stale brand leak from v1.x config-key names (SIGNALING_HOST,
+# STUN_HOST, TURN_HOST, SERVICE_ID, provider_srt).
+patterns = [
+    "OpenSSL",
+    "libcurl",
+    "Eclipse Paho",
+    "libpaho",
+    "paho-mqtt",
+    "Mosquitto",
+    "libsrt",
+    "libjuice",
+    "libevent",
+    "Augentix",
+    "GCC:",
+    "SIGNALING_HOST",
+    "STUN_",
+    "TURN_",
+    "SERVICE_ID",
+    "provider_srt",
+]
+
+[allowed_needed_libs]
+# ELF DT_NEEDED entries that ARE allowed in the final ap2p binary.
+# Everything else is a brand leak.  libap2p_tls.so.1 / libap2p_crypto.so.1
+# are reserved for v2.1 mTLS — symlinked to /usr/lib/libssl.so.3 and
+# libcrypto.so.3 on the camera, but not present in the v2.0 build's
+# NEEDED set.
+allowed = [
+    "libc.so.0",
+    "ld-uClibc.so.1",
+    "libgcc_s.so.1",
+    "libatomic.so.1",
+    "libap2p_tls.so.1",
+    "libap2p_crypto.so.1",
+]
+
+[config_delivery]
+# Runtime config in v2.0 is NOT a file on the camera.  It is delivered as an
+# MQTT retained message on topic torque/rx/<NODE_ID>/81.  The broker stores
+# the payload once (publisher uses --retain); every camera that subscribes
+# receives it immediately on subscribe.  ap2p parses it into in-memory state
+# only.  No on-device ap2p.conf file exists in v2.0.
+delivery_topic   = "torque/rx/<NODE_ID>/81"
+delivery_mode    = "mqtt-retained"
+on_camera_file   = "<none>"
+hot_reload       = true   # subsequent retained payloads update in-process
+
+[config_keys]
+# The 17 brand-neutral keys in the case-81 payload.  Parsed by
+# src/ap2p/config.c::apply_ap2p_conf_payload().  Order here mirrors the
+# parse table.
+keys = [
+    "NODE_ID",
+    "CTRL_HOST",
+    "CTRL_PORT",
+    "CTRL_SCHEME",
+    "CTRL_TOKEN",
+    "EDGE_HOST",
+    "EDGE_PORT",
+    "RELAY_HOST",
+    "RELAY_PORT",
+    "RELAY_USER",
+    "RELAY_PASS",
+    "SRC_HOST",
+    "SRC_PORT",
+    "SRC_PATH",
+    "SRC_AUTH",
+    "LATENCY_MS",
+    "VERBOSE",
+]

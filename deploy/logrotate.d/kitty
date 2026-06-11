@@ -1,0 +1,19 @@
+# /etc/logrotate.d/kitty — only used on builds that include the full
+# logrotate binary (rare on busybox+uclibc kittycams).  The production
+# fallback is the size-based in-script rotation done by deploy/ambicam.sh.
+# Keeping this file around for parity with other production fleets and as
+# documentation of the intended retention policy.
+
+/mny/mtd/ipc/ambicam/MQTT_vcamclient.log
+/mny/mtd/ipc/ambicam/provider_srt.log
+/mny/mtd/ipc/ambicam/P2Pambicam.log
+{
+    size 256k
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate           # avoids HUP-ing the daemons (they don't reopen logs)
+    create 0644 root root
+}

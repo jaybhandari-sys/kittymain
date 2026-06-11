@@ -1,0 +1,444 @@
+# =============================================================================
+#  CI/CD for kitty-augentix-camera.
+#
+#  v0.1.x — v0.x.x:  ship the launcher + configs only ("scripts release").
+#                     Cross-compiled binaries are shipped from a separate
+#                     branch once the Augentix toolchain is wired through.
+#
+#  v1.x.x+:           full cross-compile of provider_srt etc. — requires the
+#                     TOOLCHAIN_S3_URL repo variable to point at an `.tar.xz`
+#                     of /opt/augentix-tc/arm-augentix-linux-uclibcgnueabihf
+#                     (we have one at /tmp/repos/Eco-Series-Kitty/toolchain/
+#                     locally; upload + paste URL into repo Variables UI).
+#
+#  On every push:  lint + native (x86_64) build of signaling_server.
+#  On tag push v*.*.*:  publish a signed release tarball.
+# =============================================================================
+name: build-augentix
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents:    write    # for release upload
+  packages:    read
+
+env:
+  TOOLCHAIN_S3_URL: ${{ vars.TOOLCHAIN_S3_URL }}    # optional; set in repo Variables UI
+  TOOLCHAIN_PREFIX: arm-augentix-linux-uclibcgnueabihf
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) shellcheck on launcher + lint on configs (fast feedback)
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck the production launcher
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          # POSIX sh, not bash — be explicit so subtle bashisms don't sneak in.
+          shellcheck --shell=sh deploy/ambicam.sh
+
+  # ---------------------------------------------------------------------------
+  # 2) Native x86_64 build (signaling, consumer-srt) — runs every push.
+  #    Cross-compile is gated by TOOLCHAIN_S3_URL availability.
+  # ---------------------------------------------------------------------------
+  build-native:
+    needs: lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # for git describe / tag-based version stamping
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential pkg-config
+
+      - name: build libjuice (native)
+        run: |
+          cd third_party/libjuice
+          mkdir -p build
+          cd build
+          # NO_TESTS=ON: we didn't vendor libjuice/test/ (it pulls in extra
+          # deps and we don't run upstream's tests).  Tests would need the
+          # libjuice TESTS_SOURCES variable populated.
+          cmake .. \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNO_TESTS=ON
+          make -j$(nproc)
+          ls -la libjuice.a
+
+      - name: build native signaling + consumer
+        # The Makefile expects LIBJUICE_DIR at ../libjuice relative to build/.
+        # In this layout libjuice is at third_party/libjuice, so override.
+        run: |
+          cd build
+          make all LIBJUICE_DIR=$GITHUB_WORKSPACE/third_party/libjuice 2>&1 | tail -50 || true
+          ls -la *.bin 2>/dev/null || ls -la binaries/ 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # 3) Cross-compile for the camera — only when toolchain is available.
+  # ---------------------------------------------------------------------------
+  build-cross:
+    needs: lint
+    runs-on: ubuntu-22.04
+    if: ${{ vars.TOOLCHAIN_S3_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: cache toolchain
+        id: cache-tc
+        uses: actions/cache@v4
+        with:
+          path: /opt/augentix-tc
+          key:  augentix-tc-${{ vars.TOOLCHAIN_VERSION || 'v1' }}
+      - name: fetch + extract toolchain
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /opt/augentix-tc
+          curl -fsSL "$TOOLCHAIN_S3_URL" | sudo tar -xJ -C /opt/augentix-tc
+          ls /opt/augentix-tc
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential tcl patchelf python3
+      - name: prepare toolchain (chmod + symlinks the Makefile expects)
+        run: |
+          TC=/opt/augentix-tc/${TOOLCHAIN_PREFIX}
+          sudo chmod +x  $TC/bin/* 2>/dev/null || true
+          sudo chmod +x  $TC/libexec/gcc/*/*/* 2>/dev/null || true
+          sudo ln -sf $TC/bin/${TOOLCHAIN_PREFIX}-as  $TC/bin/as 2>/dev/null || true
+          sudo ln -sf $TC/bin/${TOOLCHAIN_PREFIX}-ld  $TC/bin/ld 2>/dev/null || true
+          ${TC}/bin/${TOOLCHAIN_PREFIX}-gcc --version | head -1
+      - name: cross-compile libsrt (ARM Augentix)
+        run: |
+          cd third_party/libsrt
+          mkdir -p build-arm-augentix-linux-uclibcgnueabihf
+          cd build-arm-augentix-linux-uclibcgnueabihf
+          export PATH=/opt/augentix-tc/${TOOLCHAIN_PREFIX}/bin:$PATH
+          cmake .. \
+            -DCMAKE_C_COMPILER=${TOOLCHAIN_PREFIX}-gcc \
+            -DCMAKE_CXX_COMPILER=${TOOLCHAIN_PREFIX}-g++ \
+            -DCMAKE_AR=$(which ${TOOLCHAIN_PREFIX}-ar) \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=arm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_APPS=OFF \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_ENCRYPTION=OFF \
+            -DENABLE_HAICRYPT_PRINTABLE=OFF \
+            -DENABLE_BONDING=OFF \
+            -DENABLE_TESTING=OFF \
+            -DENABLE_UNITTESTS=OFF
+          make -j$(nproc) srt_static 2>&1 | tail -20
+          ls -lh libsrt.a
+      - name: cross-compile provider_srt (KITTY_NO_TLS for first rollout)
+        run: |
+          cd build
+          # LIBSRT_DIR points at the libsrt source root (sibling of build-arm-augentix dir).
+          make provider-srt-arm \
+              LIBSRT_DIR=$GITHUB_WORKSPACE/third_party/libsrt \
+              TOOLCHAIN_DIR=/opt/augentix-tc/${TOOLCHAIN_PREFIX} \
+              KITTY_TLS_FLAG=-DKITTY_NO_TLS 2>&1 | tail -30
+      - name: cross-compile MQTT_vcamclient_Augentix (case-81 provider_srt.conf push)
+        run: |
+          # gcc invokes `as` from PATH; without this the SYSTEM as is found and
+          # bails on the toolchain's `-march=armv7ve`.  Same export pattern as
+          # the provider_srt step above.
+          export PATH=/opt/augentix-tc/${TOOLCHAIN_PREFIX}/bin:$PATH
+          cd src/mqtt-vcamclient
+          make all \
+              REPO_ROOT=$GITHUB_WORKSPACE \
+              TOOLCHAIN_DIR=/opt/augentix-tc/${TOOLCHAIN_PREFIX} \
+              TOOLCHAIN_PREFIX=${TOOLCHAIN_PREFIX} \
+              BIN_DIR=$GITHUB_WORKSPACE/build/binaries-arm-augentix-linux-uclibcgnueabihf 2>&1 | tail -30
+      - name: cross-compile ap2p (v2.0 single-binary)
+        # Builds the v2.0 single binary: libsrt static + paho/curl/ssl/crypto
+        # dynamic.  IMPORTANT: pipefail is set so make failures actually break
+        # the build (without it, `make … 2>&1 | tail -30` silently exits 0
+        # whenever tail succeeds — we lost a build to this in Phase A).
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH=/opt/augentix-tc/${TOOLCHAIN_PREFIX}/bin:$PATH
+          cd src/ap2p
+          make all \
+              REPO_ROOT=$GITHUB_WORKSPACE \
+              TOOLCHAIN_DIR=/opt/augentix-tc/${TOOLCHAIN_PREFIX} \
+              TOOLCHAIN_PREFIX=${TOOLCHAIN_PREFIX} \
+              BIN_DIR=$GITHUB_WORKSPACE/build/binaries-arm-augentix-linux-uclibcgnueabihf
+          BIN=$GITHUB_WORKSPACE/build/binaries-arm-augentix-linux-uclibcgnueabihf/ap2p
+          test -f "$BIN"
+          file "$BIN"
+          echo "ap2p size: $(stat -c%s "$BIN") bytes"
+      - name: verify ap2p brand-leak gate (informational on PR, HARD-FAIL on v2.x tag)
+        # On a PR / non-tag push: run the gate but report-only (so iterating
+        # on Phase D scrub patterns doesn't break the build).  On a v2.x tag
+        # push: hard-fail if anything leaks — this is the release gate.
+        shell: bash
+        run: |
+          set -uo pipefail
+          BIN=build/binaries-arm-augentix-linux-uclibcgnueabihf/ap2p
+          if [[ "${GITHUB_REF}" == refs/tags/v2* ]]; then
+              echo "::group::brand-leak gate (HARD-FAIL on v2.x tag)"
+              bash branding/verify.sh "$BIN"
+              echo "::endgroup::"
+          else
+              echo "::group::brand-leak gate (informational)"
+              bash branding/verify.sh "$BIN" || \
+                  echo "::warning::brand-leak gate would FAIL on a v2.x tag — fix before tagging"
+              echo "::endgroup::"
+          fi
+      - name: smoke-test the cross-compiled binaries
+        run: |
+          OUT=$GITHUB_WORKSPACE/build/binaries-arm-augentix-linux-uclibcgnueabihf
+          for B in provider_srt MQTT_vcamclient_Augentix; do
+            BIN=$OUT/$B
+            test -f "$BIN" || { echo "MISSING: $BIN"; exit 1; }
+            file "$BIN"
+            echo "size: $(stat -c%s "$BIN") bytes"
+          done
+      # ----- TAG-ONLY: bundle + publish release straight from this job -----
+      - name: stage release bundle (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ github.ref_name }}"
+          V="${V#v}"
+          STAGE=$(mktemp -d)
+          mkdir -p $STAGE/ambicam
+          BIN_OUT=build/binaries-arm-augentix-linux-uclibcgnueabihf
+          IS_V2=0
+          [[ "${{ github.ref_name }}" == v2* ]] && IS_V2=1
+
+          if [ "$IS_V2" = "1" ]; then
+            # v2.x release: single ap2p binary + minimal v2 launcher.  No
+            # provider_srt, no MQTT_vcamclient_Augentix, no on-disk conf.
+            cp deploy/ambicam.sh.v2 $STAGE/ambicam/ambicam.sh
+            chmod +x                $STAGE/ambicam/ambicam.sh
+            cp $BIN_OUT/ap2p        $STAGE/ambicam/ap2p
+            chmod +x                $STAGE/ambicam/ap2p
+            cp deploy/logrotate.d/kitty $STAGE/ambicam/kitty.logrotate
+          else
+            # v1.x release: keep the legacy 2-binary layout for hot-fix paths.
+            cp deploy/ambicam.sh                          $STAGE/ambicam/ambicam.sh
+            chmod +x                                       $STAGE/ambicam/ambicam.sh
+            cp deploy/templates/provider_srt.conf.example $STAGE/ambicam/provider_srt.conf.example
+            cp deploy/logrotate.d/kitty                   $STAGE/ambicam/kitty.logrotate
+            cp $BIN_OUT/provider_srt              $STAGE/ambicam/
+            cp $BIN_OUT/MQTT_vcamclient_Augentix  $STAGE/ambicam/
+          fi
+          echo "$V"                                    > $STAGE/ambicam/VERSION
+          date -u +'%Y-%m-%dT%H:%M:%SZ'                > $STAGE/ambicam/BUILT_AT
+          echo "${{ github.sha }}"                     > $STAGE/ambicam/COMMIT
+          ls -lh $STAGE/ambicam/
+          tar -C $STAGE -czf kitty-augentix-camera-${V}.tar.gz ambicam/
+          sha256sum   kitty-augentix-camera-${V}.tar.gz > kitty-augentix-camera-${V}.tar.gz.sha256
+          ls -la      kitty-augentix-camera-*
+
+      # ----- TAG-ONLY (v2.x): firmware-update-tool-compatible bundle ------
+      # The legacy firmware updater (per ops/firmware-update-tool.md, lifted
+      # from kitty_process.txt) extracts `Augentix.tar.gz` → `AugenTix/`,
+      # then runs:
+      #   cp *.crt client.key  → /etc/jffs2/ambicam
+      #   cp *                 → /mny/mtd/ipc/ambicam
+      #   rm /mny/mtd/ipc/ambicam/{*.crt,client.key}
+      #   mv ambicam.sh        → /mny/mtd/ipc/ambicam.sh
+      # We produce a tarball that survives that recipe end-to-end.  Includes:
+      #   - ap2p, ambicam.sh, config.json, VERSION, BUILT_AT, COMMIT, logrotate
+      #   - real .so files (libpaho-mqtt3cs.so.1.3.14, libcurl.so.4)
+      #   - branded + system symlinks (libap2p_*.so.1, libpaho-mqtt3cs.so.1,
+      #     libssl.so.1.1, libcrypto.so.1.1)
+      #   - empty kitty.crt / client.key placeholders so the tool's `cp *.crt
+      #     client.key` step doesn't error (v2.0 is KITTY_NO_TLS — these are
+      #     reserved for v2.1 mTLS).
+      - name: stage firmware-tool bundle (Augentix.tar.gz, v2.x tags only)
+        if: startsWith(github.ref, 'refs/tags/v2')
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ github.ref_name }}"
+          V="${V#v}"
+          STAGE=$(mktemp -d)
+          BUNDLE="$STAGE/AugenTix"
+          mkdir -p "$BUNDLE"
+          BIN_OUT=build/binaries-arm-augentix-linux-uclibcgnueabihf
+          MQTT_LIB=src/mqtt-vcamclient/deps/lib
+
+          # 1. Launcher + binary
+          cp deploy/ambicam.sh.v2 "$BUNDLE/ambicam.sh"
+          chmod +x                 "$BUNDLE/ambicam.sh"
+          cp $BIN_OUT/ap2p         "$BUNDLE/ap2p"
+          chmod +x                 "$BUNDLE/ap2p"
+
+          # 2. MQTT bootstrap conf — staging defaults; operators rewrite per-site.
+          cat > "$BUNDLE/config.json" <<'JSON'
+          {
+            "mqttUrl": "tcp://mqtt-staging.devices.arcisai.io:443",
+            "mqttUrl_BKP": "tcp://mqtt-staging.devices.arcisai.io:443",
+            "username": "Torque",
+            "password": "Raptor@0",
+            "productType": "Augentix",
+            "firmware": "A_Series_0.12.1"
+          }
+          JSON
+
+          # 3. Versioning + provenance
+          echo "$V"                       > "$BUNDLE/VERSION"
+          date -u +'%Y-%m-%dT%H:%M:%SZ'   > "$BUNDLE/BUILT_AT"
+          echo "${{ github.sha }}"        > "$BUNDLE/COMMIT"
+
+          # 4. Real .so files — named EXACTLY as they appear in ap2p's
+          #    DT_NEEDED so the dynamic loader finds them at runtime.
+          #    NO SYMLINKS in the tarball: busybox `cp *` follows symlinks
+          #    and would copy the underlying file again under each linked
+          #    name, exhausting the 1.5 MB /mny/mtd/ipc partition.  See
+          #    docs/SPACE_BUDGET.md for the full math.
+          #
+          #    Source: vendored in src/mqtt-vcamclient/deps/lib/.
+          cp $MQTT_LIB/libpaho-mqtt3cs.so.1.3.14 "$BUNDLE/libpaho-mqtt3cs.so.1"
+          cp $MQTT_LIB/libcurl.so                "$BUNDLE/libcurl.so.4"
+          chmod 755                              "$BUNDLE/libpaho-mqtt3cs.so.1" "$BUNDLE/libcurl.so.4"
+
+          # 5. Empty placeholders so the firmware tool's recipe step
+          #    `cp *.crt client.key /etc/jffs2/ambicam` doesn't fail when
+          #    the shell expands the globs.  v2.0 is KITTY_NO_TLS — these
+          #    are 0-byte stubs.  v2.1 will replace them with real per-
+          #    device mTLS material.  Cost: 0 bytes payload, 2 inodes.
+          : > "$BUNDLE/kitty.crt"
+          : > "$BUNDLE/client.key"
+
+          # Note: v2.0.3 dropped 9 entries that v2.0.1 shipped — six branded /
+          # legacy SONAME symlinks (libap2p_msg.so.1, libap2p_net.so.1,
+          # libap2p_tls.so.1, libap2p_crypto.so.1, libssl.so.1.1,
+          # libcrypto.so.1.1), kitty.logrotate (no logrotate binary on
+          # the camera + v2 has in-script rotation), and the
+          # libpaho-mqtt3cs.so.1.3.14 → libpaho-mqtt3cs.so.1 symlink pair
+          # (now a single real file at the DT_NEEDED name).  The branded
+          # SONAMEs return in v2.1 Phase F when patchelf rewrites
+          # DT_NEEDED inside ap2p itself.
+
+          echo "--- AugenTix/ contents (v2.0.3 layout: zero symlinks) ---"
+          ls -la "$BUNDLE/"
+          echo "--- AugenTix/ size budget ---"
+          du -sb "$BUNDLE/"
+          du  -b "$BUNDLE"/* | sort -nr
+
+          # 6. Tar it.  Plain -czf — there are no symlinks any more, so
+          #    -h vs no -h is moot; we keep no -h for safety.
+          tar -C $STAGE -czf Augentix.tar.gz AugenTix/
+          sha256sum   Augentix.tar.gz > Augentix.tar.gz.sha256
+          ls -la      Augentix.tar.gz Augentix.tar.gz.sha256
+
+      - name: publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kitty-augentix-camera-*.tar.gz
+            kitty-augentix-camera-*.tar.gz.sha256
+            Augentix.tar.gz
+            Augentix.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------------------
+  # 4) Package the deployable bundle.  Currently launcher + configs + (if
+  #    available) cross-compiled binaries pulled from the build-cross artifact.
+  # ---------------------------------------------------------------------------
+  # non-tag builds only — produces a short-retention debug artifact.
+  # Tag builds publish the release directly from build-cross (no artifact
+  # roundtrip needed, no GitHub Actions storage quota pressure).
+  package:
+    needs: [build-native]
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: pull cross artifacts if present
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-arm-augentix-${{ github.sha }}
+          path: cross-bin/
+        continue-on-error: true
+
+      - name: compute version
+        id: ver
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            V="${{ github.ref_name }}"
+            V="${V#v}"
+          else
+            V="$(git describe --tags --always --dirty 2>/dev/null || echo 0.0.0-dev)"
+            V="${V#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V"
+
+      - name: stage bundle
+        run: |
+          V=${{ steps.ver.outputs.version }}
+          STAGE=$(mktemp -d)
+          mkdir -p $STAGE/ambicam
+          # production launcher
+          cp deploy/ambicam.sh             $STAGE/ambicam/ambicam.sh
+          chmod +x                          $STAGE/ambicam/ambicam.sh
+          # config templates (real values filled at install time on the camera)
+          cp deploy/templates/provider_srt.conf.example $STAGE/ambicam/provider_srt.conf.example
+          # systemd / logrotate references
+          cp deploy/logrotate.d/kitty       $STAGE/ambicam/kitty.logrotate
+          # version stamp
+          echo "$V" > $STAGE/ambicam/VERSION
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > $STAGE/ambicam/BUILT_AT
+          echo "${{ github.sha }}" > $STAGE/ambicam/COMMIT
+          # if cross-compiled binaries were produced this run, include them.
+          # The artifact preserves the upload path build/binaries-arm-.../<binary>
+          # inside cross-bin/, so use find rather than a fixed cp source.
+          for B in provider_srt MQTT_vcamclient_Augentix; do
+              CROSS_BIN=$(find cross-bin -name "$B" -type f 2>/dev/null | head -1)
+              if [ -n "$CROSS_BIN" ] && [ -f "$CROSS_BIN" ]; then
+                  cp "$CROSS_BIN" $STAGE/ambicam/
+                  ls -lh $STAGE/ambicam/$B
+                  file   $STAGE/ambicam/$B
+                  echo "(included cross-compiled $B at $CROSS_BIN)" >> $STAGE/ambicam/VERSION
+              else
+                  echo "::warning::no cross-compiled $B found under cross-bin/"
+              fi
+          done
+          # pack
+          tar -C $STAGE -czf kitty-augentix-camera-${V}.tar.gz ambicam/
+          sha256sum kitty-augentix-camera-${V}.tar.gz > kitty-augentix-camera-${V}.tar.gz.sha256
+          ls -la kitty-augentix-camera-${V}*
+
+      - name: upload artifact (short retention to stay under storage quota)
+        # The org has limited GitHub Actions storage; for non-tag builds we
+        # only need the artifact for ~24 hours of debugging.  On tag builds
+        # the next job uploads directly to the GitHub Release (which doesn't
+        # count against Actions storage).
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        continue-on-error: true        # don't fail the run on quota issues
+        with:
+          name: kitty-augentix-camera-${{ steps.ver.outputs.version }}
+          path: |
+            kitty-augentix-camera-*.tar.gz
+            kitty-augentix-camera-*.tar.gz.sha256
+          retention-days: 1
+
+      # (Release publishing moved to build-cross so the cross-compiled
+      #  provider_srt binary is included.  See build-cross "publish
+      #  GitHub Release (tag only)" step.)

@@ -1,0 +1,20 @@
+[Unit]
+Description=Arcis SRT Consumer (Phase 1) — accepts SRT from cameras, fans out HTTP-FLV
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/p2p/srt
+ExecStart=/opt/p2p/srt/consumer_srt /opt/p2p/srt/consumer_srt.conf
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:/var/log/consumer_srt.log
+StandardError=append:/var/log/consumer_srt.log
+# Soft caps so a runaway buffer can't OOM the box.
+LimitNOFILE=65536
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

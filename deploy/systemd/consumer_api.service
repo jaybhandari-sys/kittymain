@@ -1,0 +1,17 @@
+[Unit]
+Description=P2P Camera Consumer API (Auto-Discovery)
+After=network.target signaling_server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Signalling_Server/Signaling-Server/P2P_Libjuice-main/binaries
+ExecStart=/root/Signalling_Server/Signaling-Server/P2P_Libjuice-main/binaries/consumer_api /root/Signalling_Server/Signaling-Server/P2P_Libjuice-main/binaries/consumer.conf
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=consumer-api
+
+[Install]
+WantedBy=multi-user.target

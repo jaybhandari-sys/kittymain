@@ -1,0 +1,45 @@
+# consumer_srt.conf — cloud-side SRT listener + HTTP-FLV fan-out (Phase 1)
+#
+# This process accepts ONE inbound SRT connection per stream_id and serves the
+# resulting byte stream as HTTP-FLV at HTTP_PATH on HTTP_PORT.
+#
+# To run additional cameras, start another consumer_srt process with a
+# different SRT_PORT / HTTP_PORT / STREAM_ID combination.
+
+# UDP port the cloud listens on for inbound SRT from cameras.
+SRT_PORT=9888
+
+# TCP port that phones / browsers / VLC pull HTTP-FLV from.
+HTTP_PORT=8080
+
+# Required STREAMID match.  Provider must set the same value.
+# Use the same camera_id you'd use in the existing libjuice pipeline so the
+# Android URL  http://<host>:8080/flv/live_ch0_1.flv?verify=<token>  works
+# unchanged for clients.
+STREAM_ID=cam001
+
+# HTTP path to serve the live FLV at.  Match what the Android app builds.
+HTTP_PATH=/flv/live_ch0_1.flv
+
+# Optional ?verify=<token> check.  Leave blank to disable; otherwise the value
+# must equal the AES-CBC base64 token the Android app builds from
+# "abcdefg&<user>&<pass>" (see project_arcis_crypto note in memory).
+VERIFY_TOKEN=
+
+# SRT receiver latency budget in milliseconds.  Higher = smoother under loss
+# but more lag.  300 ms is a good live-CCTV default.
+LATENCY_MS=300
+
+# 1 to log every burst.  Leave 0 in production.
+VERBOSE=0
+
+# 0 = buffer/stream mode (FLV byte stream — recommended).
+# 1 = message mode (each srt_send is a discrete message; not what we want here).
+MESSAGE_API=0
+
+# Optional pre-shared passphrase (10..79 chars).  Leave blank to disable
+# encryption (we already disabled crypto at libsrt build time, so setting this
+# will fail to connect — it's here only for future use after rebuilding libsrt
+# with -DENABLE_ENCRYPTION=ON).
+# PASSPHRASE=
+# PBKEYLEN=16

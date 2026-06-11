@@ -1,0 +1,49 @@
+# Build artifacts
+*.o
+*.d
+*.a
+# But: deploy/logrotate.d/ is a config DIRECTORY (not a make .d dep file), keep it.
+!deploy/logrotate.d/
+!deploy/logrotate.d/**
+*.so
+*.so.*
+binaries-arm-augentix-linux-uclibcgnueabihf/*.bak*
+binaries/*.bak*
+binaries/*.old
+build/intermediates/
+**/build-*/
+
+# ap2p SRT header shim (built at make-time from third_party/libsrt/srtcore).
+src/ap2p/.srt_shim/
+
+# Local config (each developer's secrets/paths)
+local.properties
+.env
+*.local
+
+# Toolchain (huge — fetched by CI from S3)
+toolchain/arm-augentix-*/
+
+# Logs / state
+*.log
+signaling.stdout.log
+signaling.stderr.log
+
+# Editor + OS
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+
+# Camera-side runtime .so files (deploy artefacts, NOT build outputs).  Bring them in.
+!deploy/augentix-runtime/
+!deploy/augentix-runtime/**
+
+# Vendored ARM cross-compile libraries for MQTT_vcamclient_Augentix
+# (paho-mqtt3cs, libssl/libcrypto, libcurl, etc.).  These are pre-built
+# .so/.a artefacts from the Augentix toolchain — needed at LINK time in
+# CI so the cross-compile can resolve -lpaho-mqtt3cs / -lssl / -lcrypto /
+# -lcurl.  Source built once and committed; not regenerated per build.
+!src/mqtt-vcamclient/deps/lib/
+!src/mqtt-vcamclient/deps/lib/**

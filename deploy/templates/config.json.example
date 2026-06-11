@@ -1,0 +1,11 @@
+{
+  "_comment":     "MQTT bootstrap config for /mny/mtd/ipc/ambicam/config.json on the camera. Real credentials are provisioned during manufacturing — never commit them.",
+  "mqttUrl":      "tcp://prong.arcisai.io:1883",
+  "mqttUrl_BKP":  "tcp://prongbackup.arcisai.io:1883",
+  "username":     "REPLACE_WITH_MQTT_USERNAME",
+  "password":     "REPLACE_WITH_MQTT_PASSWORD",
+  "productType":  "Augentix",
+  "p2pAmbicam":   "P2Pambicam_0.8",
+  "vcamAmbicam":  "vcamclient-uclinux_0.9",
+  "firmware":     "A_Series_0.12.1"
+}
