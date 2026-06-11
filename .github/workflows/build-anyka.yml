@@ -1,0 +1,240 @@
+# =============================================================================
+#  CI/CD for kitty-anyka-camera.
+#
+#  Toolchain: arm-anycloud-linux-uclibcgnueabi (GCC 5.5.0, Buildroot 2018.02.7)
+#  Target:    Anyka AK3918 / AK3916 armv5 uClibc cameras (e.g. 192.168.5.97)
+#
+#  The cross-toolchain is installed on the self-hosted runner at:
+#    /home/dilip/actions-runner/_work/_tool/arm-anycloud-linux-uclibcgnueabi
+#
+#  Two quirks handled in every cross-compile step:
+#    1. LD_LIBRARY_PATH — cc1 needs libmpfr.so.4 from the toolchain's lib64/
+#    2. -B${TOOLCHAIN}/bin/ — tells gcc to use the toolchain's `as`, not /usr/bin/as
+#
+#  On every push:  cross-compile provider_srt + ap2p for ARM Anyka.
+#  On tag v*.*.*-anyka:  publish a signed release tarball (Anyka.tar.gz).
+# =============================================================================
+name: build-anyka
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*.*.*-anyka' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  TOOLCHAIN_DIR:    /home/dilip/actions-runner/_work/_tool/arm-anycloud-linux-uclibcgnueabi
+  TOOLCHAIN_PREFIX: arm-anycloud-linux-uclibcgnueabi
+  # cc1 needs libmpfr.so.4 from the toolchain — set once, inherited by all steps
+  LD_LIBRARY_PATH:  /home/dilip/actions-runner/_work/_tool/arm-anycloud-linux-uclibcgnueabi/lib64:/home/dilip/actions-runner/_work/_tool/arm-anycloud-linux-uclibcgnueabi/lib
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Cross-compile for Anyka camera — runs on the self-hosted runner which
+  #    has the toolchain installed locally.
+  # ---------------------------------------------------------------------------
+  build-cross-anyka:
+    runs-on: [self-hosted, linux, camera-network]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: verify toolchain
+        run: |
+          TC=${{ env.TOOLCHAIN_DIR }}
+          # Ensure libexec binaries are executable (unzip loses +x on some runners)
+          chmod +x $TC/libexec/gcc/${{ env.TOOLCHAIN_PREFIX }}/5.5.0/* 2>/dev/null || true
+          chmod +x $TC/bin/* 2>/dev/null || true
+          # as symlink so gcc finds the ARM assembler, not /usr/bin/as
+          ln -sf $TC/bin/${{ env.TOOLCHAIN_PREFIX }}-as $TC/bin/as 2>/dev/null || true
+          ln -sf $TC/bin/${{ env.TOOLCHAIN_PREFIX }}-ld $TC/bin/ld 2>/dev/null || true
+          $TC/bin/arm-linux-gcc -B$TC/bin/ --version | head -1
+
+      - name: install build deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake build-essential tcl
+
+      # ── libsrt: cross-compile for Anyka (armv5, soft-float, uClibc) ──────
+      - name: cross-compile libsrt (ARM Anyka)
+        run: |
+          TC=${{ env.TOOLCHAIN_DIR }}
+          PREFIX=${{ env.TOOLCHAIN_PREFIX }}
+          cd third_party/libsrt
+          mkdir -p build-$PREFIX
+          cd build-$PREFIX
+          cmake .. \
+            -DCMAKE_C_COMPILER="$TC/bin/${PREFIX}-gcc" \
+            -DCMAKE_CXX_COMPILER="$TC/bin/${PREFIX}-g++" \
+            -DCMAKE_AR=$(which ${PREFIX}-ar 2>/dev/null || echo "$TC/bin/${PREFIX}-ar") \
+            -DCMAKE_C_FLAGS="-B$TC/bin/ -march=armv5 -mfloat-abi=soft -Os -ffunction-sections -fdata-sections" \
+            -DCMAKE_CXX_FLAGS="-B$TC/bin/ -march=armv5 -mfloat-abi=soft -Os -ffunction-sections -fdata-sections" \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=arm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_APPS=OFF \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_ENCRYPTION=OFF \
+            -DENABLE_HAICRYPT_PRINTABLE=OFF \
+            -DENABLE_BONDING=OFF \
+            -DENABLE_TESTING=OFF \
+            -DENABLE_UNITTESTS=OFF
+          make -j$(nproc) srt_static 2>&1 | tail -20
+          ls -lh libsrt.a
+
+      # ── provider_srt: the main camera binary ─────────────────────────────
+      - name: cross-compile provider_srt (ARM Anyka)
+        run: |
+          TC=${{ env.TOOLCHAIN_DIR }}
+          PREFIX=${{ env.TOOLCHAIN_PREFIX }}
+          BIN_OUT=build/binaries-$PREFIX
+          mkdir -p $BIN_OUT
+
+          # Set up the SRT include shim (srt.h lives in srtcore/ but included as <srt/srt.h>)
+          SHIM=src/consumer-srt-android/srt-include-shim
+          mkdir -p $SHIM/srt
+          cp third_party/libsrt/srtcore/srt.h            $SHIM/srt/ 2>/dev/null || true
+          cp third_party/libsrt/srtcore/access_control.h $SHIM/srt/ 2>/dev/null || true
+          cp third_party/libsrt/srtcore/logging_api.h    $SHIM/srt/ 2>/dev/null || true
+          cp third_party/libsrt/srtcore/platform_sys.h   $SHIM/srt/ 2>/dev/null || true
+          cp third_party/libsrt/srtcore/udt.h            $SHIM/srt/ 2>/dev/null || true
+
+          LIBSRT_BUILD=third_party/libsrt/build-$PREFIX
+
+          # Compile
+          $TC/bin/${PREFIX}-gcc \
+            -B$TC/bin/ \
+            -march=armv5 -mfloat-abi=soft \
+            -Os -Wall -Wno-missing-field-initializers \
+            -ffunction-sections -fdata-sections \
+            -fno-unwind-tables -fno-asynchronous-unwind-tables \
+            -DSRT_STATIC -DKITTY_NO_TLS -std=c99 \
+            -I$SHIM -Ithird_party/libsrt/srtcore -I$LIBSRT_BUILD -Isrc \
+            -c src/provider-srt/provider_srt.c -o /tmp/provider_srt.anyka.o
+
+          # Link
+          $TC/bin/${PREFIX}-g++ \
+            -B$TC/bin/ \
+            -march=armv5 -mfloat-abi=soft -Os \
+            /tmp/provider_srt.anyka.o \
+            $LIBSRT_BUILD/libsrt.a \
+            -static-libgcc -static-libstdc++ \
+            -lpthread -lm -ldl \
+            -Wl,--gc-sections -Wl,--strip-all \
+            -o $BIN_OUT/provider_srt
+
+          $TC/bin/${PREFIX}-strip $BIN_OUT/provider_srt 2>/dev/null || true
+          ls -lh $BIN_OUT/provider_srt
+          file   $BIN_OUT/provider_srt
+
+      # ── MQTT vcamclient (Anyka variant) ───────────────────────────────────
+      - name: cross-compile MQTT_vcamclient_Anyka
+        run: |
+          TC=${{ env.TOOLCHAIN_DIR }}
+          PREFIX=${{ env.TOOLCHAIN_PREFIX }}
+          BIN_OUT=$GITHUB_WORKSPACE/build/binaries-$PREFIX
+          cd src/mqtt-vcamclient
+          make all \
+            REPO_ROOT=$GITHUB_WORKSPACE \
+            TOOLCHAIN_DIR=$TC \
+            TOOLCHAIN_PREFIX=$PREFIX \
+            BIN_DIR=$BIN_OUT \
+            CC="$TC/bin/${PREFIX}-gcc -B$TC/bin/" \
+            TARGET=$BIN_OUT/MQTT_vcamclient_Anyka 2>&1 | tail -20
+
+      # ── ap2p: single-binary v2 (Anyka) ───────────────────────────────────
+      - name: cross-compile ap2p (ARM Anyka)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TC=${{ env.TOOLCHAIN_DIR }}
+          PREFIX=${{ env.TOOLCHAIN_PREFIX }}
+          export PATH=$TC/bin:$PATH
+          cd src/ap2p
+          make all \
+            REPO_ROOT=$GITHUB_WORKSPACE \
+            TOOLCHAIN_DIR=$TC \
+            TOOLCHAIN_PREFIX=$PREFIX \
+            CC="$TC/bin/${PREFIX}-gcc -B$TC/bin/" \
+            CXX="$TC/bin/${PREFIX}-g++ -B$TC/bin/" \
+            STRIP="$TC/bin/${PREFIX}-strip" \
+            CFLAGS="-march=armv5 -mfloat-abi=soft -mthumb -Os -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSRT_STATIC" \
+            BIN_DIR=$GITHUB_WORKSPACE/build/binaries-$PREFIX 2>&1 | tail -30
+          BIN=$GITHUB_WORKSPACE/build/binaries-$PREFIX/ap2p
+          test -f "$BIN"
+          file "$BIN"
+          echo "ap2p size: $(stat -c%s "$BIN") bytes"
+
+      # ── Smoke test: verify ELF type ───────────────────────────────────────
+      - name: smoke-test cross-compiled binaries
+        run: |
+          PREFIX=${{ env.TOOLCHAIN_PREFIX }}
+          OUT=$GITHUB_WORKSPACE/build/binaries-$PREFIX
+          for B in provider_srt ap2p; do
+            BIN=$OUT/$B
+            test -f "$BIN" || { echo "MISSING: $BIN"; exit 1; }
+            file "$BIN" | grep -i "arm" || { echo "WRONG ELF type: $BIN"; file "$BIN"; exit 1; }
+            echo "$B: $(stat -c%s "$BIN") bytes"
+          done
+
+      # ── TAG-ONLY: bundle + release ────────────────────────────────────────
+      - name: stage release bundle (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ github.ref_name }}"
+          V="${V#v}"
+          V="${V%-anyka}"        # strip the -anyka suffix for the version number
+          PREFIX=${{ env.TOOLCHAIN_PREFIX }}
+          BIN_OUT=build/binaries-$PREFIX
+          STAGE=$(mktemp -d)
+          mkdir -p $STAGE/AnykaCam
+
+          cp $BIN_OUT/ap2p          $STAGE/AnykaCam/ap2p
+          chmod +x                   $STAGE/AnykaCam/ap2p
+          cp deploy/ambicam.sh.v2   $STAGE/AnykaCam/ambicam.sh 2>/dev/null || \
+          cp deploy/ambicam.sh      $STAGE/AnykaCam/ambicam.sh
+          chmod +x                   $STAGE/AnykaCam/ambicam.sh
+
+          # MQTT deps (dynamic .so files for uClibc camera)
+          MQTT_LIB=src/mqtt-vcamclient/deps/lib
+          if [ -f "$MQTT_LIB/libpaho-mqtt3cs.so.1.3.14" ]; then
+            cp $MQTT_LIB/libpaho-mqtt3cs.so.1.3.14 $STAGE/AnykaCam/libpaho-mqtt3cs.so.1
+            cp $MQTT_LIB/libcurl.so                 $STAGE/AnykaCam/libcurl.so.4 2>/dev/null || true
+            chmod 755 $STAGE/AnykaCam/libpaho-mqtt3cs.so.1 2>/dev/null || true
+          fi
+
+          # Versioning
+          echo "$V"                                    > $STAGE/AnykaCam/VERSION
+          date -u +'%Y-%m-%dT%H:%M:%SZ'                > $STAGE/AnykaCam/BUILT_AT
+          echo "${{ github.sha }}"                     > $STAGE/AnykaCam/COMMIT
+
+          # TLS placeholders (v2.0 is KITTY_NO_TLS)
+          : > $STAGE/AnykaCam/kitty.crt
+          : > $STAGE/AnykaCam/client.key
+
+          echo "--- AnykaCam/ contents ---"
+          ls -lh $STAGE/AnykaCam/
+          du -sb $STAGE/AnykaCam/
+
+          tar -C $STAGE -czf Anyka.tar.gz AnykaCam/
+          sha256sum Anyka.tar.gz > Anyka.tar.gz.sha256
+          ls -la Anyka.tar.gz Anyka.tar.gz.sha256
+
+      - name: publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Anyka.tar.gz
+            Anyka.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: false
