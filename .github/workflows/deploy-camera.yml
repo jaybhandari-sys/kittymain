@@ -1,0 +1,162 @@
+# =============================================================================
+#  deploy-camera.yml — Push built binaries to the LAN camera via telnet.
+#
+#  Triggers:
+#    - Automatic: after build-augentix succeeds on main (v2.x tags only).
+#    - Manual:    workflow_dispatch with optional release tag override.
+#
+#  Requirement:
+#    A GitHub Actions self-hosted runner must be registered on a machine
+#    that is on the same LAN as the camera (label: camera-network).
+#    Run ops/setup-selfhosted-runner.sh on that machine to set it up.
+#
+#  Secrets required (Settings → Secrets → Actions):
+#    CAMERA_HOST  — LAN IP of the camera (e.g. 192.168.5.97)
+#    CAMERA_USER  — telnet login username (e.g. root)
+#    CAMERA_PASS  — telnet login password
+# =============================================================================
+
+name: deploy-camera
+
+on:
+  # Auto-deploy after a successful build on main (v2.x tags only — those
+  # produce the Augentix.tar.gz firmware bundle that this workflow unpacks).
+  workflow_run:
+    workflows: ["build-augentix"]
+    types: [completed]
+    branches: [main]
+
+  # Manual trigger: lets you deploy any specific release tag, or skip the
+  # tag and just re-deploy the latest release.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to deploy (e.g. v2.1.0). Leave empty for latest."
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run — download artifact but skip telnet deploy"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read   # to download release artifacts via gh CLI
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: skip automatic runs that came from a non-tag build (those don't
+  # produce an Augentix.tar.gz release asset).
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      should_deploy: ${{ steps.gate.outputs.should_deploy }}
+      release_tag: ${{ steps.gate.outputs.release_tag }}
+    steps:
+      - name: determine whether to deploy
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            TAG="${{ inputs.release_tag }}"
+            if [ -z "$TAG" ]; then
+              TAG=$(gh release list -R "${{ github.repository }}" \
+                      --limit 1 --json tagName -q '.[0].tagName')
+            fi
+            echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # workflow_run: only proceed if the triggering run produced a release
+          # (i.e., it was a tag push that went through build-cross).
+          RUN_ID="${{ github.event.workflow_run.id }}"
+          HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
+          CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+
+          if [[ "$CONCLUSION" != "success" ]]; then
+            echo "Upstream run did not succeed (conclusion=$CONCLUSION) — skipping deploy."
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if a v2.x release was just published (Augentix.tar.gz present).
+          LATEST_TAG=$(gh release list -R "${{ github.repository }}" \
+                         --limit 1 --json tagName -q '.[0].tagName')
+          if [[ "$LATEST_TAG" == v2* ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "release_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "Latest release ($LATEST_TAG) is not a v2.x tag — skipping camera deploy."
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Deploy: runs on the self-hosted runner (must be on the camera's LAN).
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: check
+    if: needs.check.outputs.should_deploy == 'true'
+    runs-on: [self-hosted, linux, camera-network]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Python deps
+        run: pip install pexpect --quiet
+
+      - name: download release bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+        run: |
+          echo "Deploying release: $RELEASE_TAG"
+          rm -rf deploy-staging
+          mkdir -p deploy-staging
+          gh release download "$RELEASE_TAG" \
+            -R "${{ github.repository }}" \
+            --pattern "Augentix.tar.gz" \
+            --dir deploy-staging/
+          cd deploy-staging
+          tar -xzf Augentix.tar.gz
+          echo "=== Bundle contents ==="
+          ls -lh AugenTix/
+
+      - name: verify bundle integrity
+        run: |
+          for f in ap2p ambicam.sh; do
+            test -f deploy-staging/AugenTix/$f || \
+              { echo "ERROR: $f missing from bundle"; exit 1; }
+          done
+          file deploy-staging/AugenTix/ap2p
+
+      - name: deploy to camera
+        if: inputs.dry_run != 'true'
+        env:
+          CAMERA_HOST: ${{ secrets.CAMERA_HOST }}
+          CAMERA_USER: ${{ secrets.CAMERA_USER }}
+          CAMERA_PASS: ${{ secrets.CAMERA_PASS }}
+        run: |
+          python3 deploy/deploy_camera.py \
+            --binaries-dir deploy-staging/AugenTix \
+            --binaries ap2p ambicam.sh
+
+      - name: dry run notice
+        if: inputs.dry_run == 'true'
+        run: echo "DRY RUN — skipped telnet deploy. Bundle OK."
+
+      - name: record deploy in job summary
+        if: always()
+        env:
+          RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Camera Deploy — $RELEASE_TAG
+          - **Camera**: \`${{ secrets.CAMERA_HOST }}\`
+          - **Tag**: \`$RELEASE_TAG\`
+          - **Dry run**: \`${{ inputs.dry_run }}\`
+          - **Result**: ${{ job.status }}
+          EOF
