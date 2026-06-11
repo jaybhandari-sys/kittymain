@@ -465,7 +465,7 @@ static pump_request_t   g_pending_pump;
 static int              g_pending_valid = 0;
 static atomic_int       g_pump_cancel  = 0;
 static atomic_int       g_pump_running = 0;
-static SRTSOCKET        g_active_srt   = SRT_INVALID_SOCK;
+static SRTSOCKET        g_active_srt   = -1;  /* SRT_INVALID_SOCK — GCC5/C99 compat */
 static pthread_t        g_pump_tid;
 static int              g_pump_started = 0;
 
