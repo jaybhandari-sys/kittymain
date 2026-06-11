@@ -157,10 +157,10 @@ jobs:
             REPO_ROOT=$GITHUB_WORKSPACE \
             TOOLCHAIN_DIR=$TC \
             TOOLCHAIN_PREFIX=$PREFIX \
-            CC="$TC/bin/${PREFIX}-gcc -B$TC/bin/" \
-            CXX="$TC/bin/${PREFIX}-g++ -B$TC/bin/" \
+            CC="$TC/bin/${PREFIX}-gcc -B$TC/bin/ -march=armv5 -mfloat-abi=soft" \
+            CXX="$TC/bin/${PREFIX}-g++ -B$TC/bin/ -march=armv5 -mfloat-abi=soft" \
             STRIP="$TC/bin/${PREFIX}-strip" \
-            CFLAGS="-march=armv5 -mfloat-abi=soft -mthumb -Os -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSRT_STATIC" \
+            ARCH_CFLAGS="" \
             LIBSRT_BUILD_ARM=$GITHUB_WORKSPACE/third_party/libsrt/build-$PREFIX \
             BIN_DIR=$GITHUB_WORKSPACE/build/binaries-$PREFIX 2>&1 | tail -30
           BIN=$GITHUB_WORKSPACE/build/binaries-$PREFIX/ap2p

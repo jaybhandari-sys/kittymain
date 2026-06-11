@@ -66,7 +66,9 @@ SRC = main.c \
 # ---- compile flags --------------------------------------------------------
 # Aggressive size + dead-code elimination.
 # -DSRT_STATIC: tells srt.h not to mark its symbols as imported.
-CFLAGS  = -mthumb -Os \
+# ARCH_CFLAGS: override for toolchains that don't support -mthumb (e.g. armv5/Anyka).
+ARCH_CFLAGS ?= -mthumb
+CFLAGS  = $(ARCH_CFLAGS) -Os \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSRT_STATIC \
           -I$(CURDIR) \
