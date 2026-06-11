@@ -57,11 +57,6 @@ jobs:
           ln -sf $TC/bin/${{ env.TOOLCHAIN_PREFIX }}-ld $TC/bin/ld 2>/dev/null || true
           $TC/bin/arm-linux-gcc -B$TC/bin/ --version | head -1
 
-      - name: install build deps
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y cmake build-essential tcl
-
       # ── libsrt: cross-compile for Anyka (armv5, soft-float, uClibc) ──────
       - name: cross-compile libsrt (ARM Anyka)
         run: |
