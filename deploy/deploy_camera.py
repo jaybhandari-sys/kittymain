@@ -32,6 +32,8 @@ CAMERA_USER = os.environ.get("CAMERA_USER", "root")
 CAMERA_PASS = os.environ["CAMERA_PASS"]
 AMBICAM_DIR = "/mny/mtd/ipc/ambicam"
 TELNET_TIMEOUT = 30
+# Anyka cameras use "$ " prompt; standard Linux root uses "# "
+SHELL_PROMPT = r"[$#] $"
 
 
 def local_ip_towards(target: str) -> str:
@@ -60,7 +62,7 @@ def start_http_server(directory: str, port: int) -> http.server.HTTPServer:
 def run_cmd(child, cmd: str, timeout: int = 60) -> str:
     """Send a command and wait for the shell prompt."""
     child.sendline(cmd)
-    child.expect("#", timeout=timeout)
+    child.expect(SHELL_PROMPT, timeout=timeout)
     return child.before
 
 
@@ -80,10 +82,10 @@ def deploy(binaries_dir: str, binaries: list, port: int = 8888):
         child.expect("login:", timeout=20)
         child.sendline(CAMERA_USER)
 
-        idx = child.expect(["Password:", "#"], timeout=10)
+        idx = child.expect(["Password:", SHELL_PROMPT], timeout=10)
         if idx == 0:
             child.sendline(CAMERA_PASS)
-            child.expect("#", timeout=15)
+            child.expect(SHELL_PROMPT, timeout=15)
 
         print("[deploy] Logged in.")
 
